@@ -4,7 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
+from pathlib import Path
+
+# Allow running as `python model/train.py ...` or `cd model && python train.py ...`
+_HERE = Path(__file__).resolve().parent
+for _root in (_HERE.parent, _HERE.parent.parent):
+    if (_root / "model" / "__init__.py").exists() and str(_root) not in sys.path:
+        sys.path.insert(0, str(_root))
 
 import torch
 from torch.utils.data import DataLoader

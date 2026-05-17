@@ -4,6 +4,13 @@ from __future__ import annotations
 
 import json
 import random
+import sys
+from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent
+for _root in (_HERE.parent, _HERE.parent.parent):
+    if (_root / "model" / "__init__.py").exists() and str(_root) not in sys.path:
+        sys.path.insert(0, str(_root))
 
 import matplotlib
 matplotlib.use("Agg")
