@@ -38,12 +38,38 @@ class ConditionEncoder:
 
 
 class DateTokenizer:
-    """Char-level tokenizer for the 'd-m-yyyy' string."""
+    """Char-level tokenizer for the date string. Internally uses FIXED-WIDTH
+    `dd-mm-yyyy` (zero-padded, always 10 chars) so seq models can apply
+    position-based aux losses. Decode strips leading zeros to match `data.txt`
+    output format (`d-m-yyyy`).
+    """
+
+    @staticmethod
+    def _padded(date_str: str) -> str:
+        """`'3-1-2005'` → `'03-01-2005'`; idempotent for `'31-12-2200'`."""
+        parts = date_str.split("-")
+        if len(parts) != 3:
+            raise ValueError(f"bad date {date_str!r}")
+        d, m, y = parts
+        return f"{int(d):02d}-{int(m):02d}-{int(y):04d}"
+
+    @staticmethod
+    def _unpadded(date_str: str) -> str:
+        """Inverse of _padded. Best-effort: returns input if not parseable."""
+        parts = date_str.split("-")
+        if len(parts) != 3:
+            return date_str
+        try:
+            d, m, y = (int(p) for p in parts)
+        except ValueError:
+            return date_str
+        return f"{d}-{m}-{y}"
 
     @staticmethod
     def encode(date_str: str) -> torch.Tensor:
+        padded = DateTokenizer._padded(date_str)
         ids = [config.BOS_ID]
-        for ch in date_str:
+        for ch in padded:
             if ch not in config.CHAR_TO_IDX:
                 raise ValueError(f"char {ch!r} not in vocab")
             ids.append(config.CHAR_TO_IDX[ch])
@@ -63,7 +89,7 @@ class DateTokenizer:
             if tok == config.EOS_ID:
                 break
             out.append(config.CHAR_VOCAB[tok])
-        return "".join(out)
+        return DateTokenizer._unpadded("".join(out))
 
 
 def decode_gan_output(day_idx: int, year_digit: int, mon: str, dec: str) -> str:

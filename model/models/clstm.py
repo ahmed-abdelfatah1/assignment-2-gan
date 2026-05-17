@@ -21,11 +21,15 @@ from model.tokenizer import DateTokenizer
 
 EMB_DIM: int = 64
 HIDDEN: int = 256
-N_DOW: int = len(config.DOW_TOKENS)  # 7
 
 
 class CLSTM(nn.Module):
-    """Single-layer LSTM hidden=256 with per-step cond injection + DOW aux head."""
+    """Single-layer LSTM hidden=256 with per-step cond injection.
+
+    v3.2: DOW supervision is applied externally via char-position aux loss
+    (train.py:seq_aux_dow_loss) instead of an internal classifier head, so the
+    gradient flows through the same logits used at sampling time.
+    """
 
     def __init__(self, vocab_size: int = config.VOCAB_SIZE, cond_dim: int = config.COND_DIM,
                  emb_dim: int = EMB_DIM, hidden: int = HIDDEN) -> None:
@@ -36,7 +40,6 @@ class CLSTM(nn.Module):
         self.cond_step_proj = nn.Linear(cond_dim, emb_dim)            # added at every step
         self.lstm = nn.LSTM(emb_dim, hidden, num_layers=1, batch_first=True)
         self.head = nn.Linear(hidden, vocab_size)
-        self.aux_head = nn.Linear(hidden, N_DOW)
 
     def init_state(self, cond: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         h0c0 = self.cond_proj(cond)
@@ -48,14 +51,12 @@ class CLSTM(nn.Module):
         cond_step = self.cond_step_proj(cond).unsqueeze(1)             # (B, 1, E)
         return emb + cond_step                                         # broadcast over T
 
-    def forward(self, cond: torch.Tensor, seq_in: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Returns (char_logits over T input positions, aux DOW logits from final hidden)."""
+    def forward(self, cond: torch.Tensor, seq_in: torch.Tensor) -> torch.Tensor:
+        """Returns char_logits over the T input positions."""
         h, c = self.init_state(cond)
         x = self._step_input(cond, seq_in)
-        out, (h_final, _) = self.lstm(x, (h, c))
-        char_logits = self.head(out)                                   # (B, T, V)
-        aux_dow_logits = self.aux_head(h_final.squeeze(0))             # (B, 7)
-        return char_logits, aux_dow_logits
+        out, _ = self.lstm(x, (h, c))
+        return self.head(out)                                          # (B, T, V)
 
     @torch.no_grad()
     def sample(self, cond: torch.Tensor, temperature: float = 1.0,

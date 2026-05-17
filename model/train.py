@@ -79,25 +79,60 @@ def _cond_indices(cond: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch
     return dow_idx, mon_idx, dec_idx
 
 
-def aux_dow_loss(logits: torch.Tensor, cond: torch.Tensor,
-                 dow_lut: torch.Tensor, invalid_weight: float = 1.0) -> torch.Tensor:
-    """AC-GAN-style auxiliary loss that forces the predicted joint-softmax to honor
-    the requested DOW condition. Fully differentiable in soft-probability space.
-
-    Returns a scalar tensor combining: -log P(DOW = target) + invalid_weight * P(invalid).
-    """
-    probs = F.softmax(logits, dim=-1)              # (B, 310)
+def aux_dow_loss_from_probs(probs: torch.Tensor, cond: torch.Tensor,
+                            dow_lut: torch.Tensor,
+                            invalid_weight: float = 1.0) -> torch.Tensor:
+    """Same machinery as aux_dow_loss but consumes joint probabilities directly
+    (used by seq_aux_dow_loss where probs come from combining char positions)."""
     dow_idx, mon_idx, dec_idx = _cond_indices(cond)
-    # Per-sample (310,) tensor of DOW indices ∈ {0..6, INVALID_DOW=7}
-    dow_map = dow_lut[mon_idx, dec_idx]              # (B, 310)
-    # One-hot across 8 buckets (7 DOWs + invalid)
-    mask = F.one_hot(dow_map, num_classes=INVALID_DOW + 1).float()  # (B, 310, 8)
-    dow_probs = torch.einsum("bj,bjk->bk", probs, mask)              # (B, 8)
+    dow_map = dow_lut[mon_idx, dec_idx]                                 # (B, 310)
+    mask = F.one_hot(dow_map, num_classes=INVALID_DOW + 1).float()      # (B, 310, 8)
+    dow_probs = torch.einsum("bj,bjk->bk", probs, mask)                 # (B, 8)
     eps = 1e-8
     target_prob = dow_probs.gather(1, dow_idx.unsqueeze(1)).squeeze(1)  # (B,)
     ce = -(target_prob + eps).log().mean()
     invalid_mass = dow_probs[:, INVALID_DOW].mean()
     return ce + invalid_weight * invalid_mass
+
+
+def aux_dow_loss(logits: torch.Tensor, cond: torch.Tensor,
+                 dow_lut: torch.Tensor, invalid_weight: float = 1.0) -> torch.Tensor:
+    """AC-GAN-style auxiliary loss for cGAN/cVAE: takes 310-class joint logits."""
+    return aux_dow_loss_from_probs(F.softmax(logits, dim=-1), cond, dow_lut, invalid_weight)
+
+
+def _digit_token_ids(device: torch.device) -> torch.Tensor:
+    return torch.tensor([config.CHAR_TO_IDX[str(d)] for d in range(10)],
+                        dtype=torch.long, device=device)
+
+
+def seq_aux_dow_loss(char_logits: torch.Tensor, cond: torch.Tensor,
+                     dow_lut: torch.Tensor) -> torch.Tensor:
+    """Direct DOW supervision for fixed-width `dd-mm-yyyy` seq models.
+
+    char_logits shape (B, T, V). Under fixed-width tokenisation the input seq
+    is `[BOS, d1, d2, '-', m1, m2, '-', y1, y2, y3, y4]` (length 11) and
+    char_logits[:, k, :] predicts the (k+1)-th char of the full sequence.
+    So:
+      - char_logits[:, 0, :] predicts day-tens (d1, ∈ {0..3})
+      - char_logits[:, 1, :] predicts day-ones (d2, ∈ {0..9})
+      - char_logits[:, 9, :] predicts year-last-digit (y4, ∈ {0..9})
+
+    Restrict each to digit-token logits, softmax, outer-product into a soft
+    joint over (day_idx ∈ {0..30}, year_digit ∈ {0..9}), apply aux DOW loss.
+    """
+    digit_ids = _digit_token_ids(char_logits.device)                    # (10,)
+    p_d_tens = F.softmax(char_logits[:, 0, digit_ids[:4]], dim=-1)       # (B, 4) — tens ∈ {0..3}
+    p_d_ones = F.softmax(char_logits[:, 1, digit_ids], dim=-1)           # (B, 10)
+    p_y9     = F.softmax(char_logits[:, 9, digit_ids], dim=-1)           # (B, 10)
+
+    # Joint over day-number ∈ {0..39}; we only keep {1..31}, i.e. day_idx {0..30}.
+    joint_40 = (p_d_tens.unsqueeze(-1) * p_d_ones.unsqueeze(-2)).reshape(-1, 40)
+    p_day31 = joint_40[:, 1:32]                                          # (B, 31)
+    p_day31 = p_day31 / p_day31.sum(-1, keepdim=True).clamp_min(1e-8)
+
+    p_joint = (p_day31.unsqueeze(-1) * p_y9.unsqueeze(-2)).reshape(-1, config.JOINT_DIM)
+    return aux_dow_loss_from_probs(p_joint, cond, dow_lut)
 
 
 def _make_loader(ds: DateDataset, batch_size: int, device: torch.device) -> DataLoader:
@@ -277,7 +312,7 @@ def train_cvae(epochs: int, batch_size: int, lr: float, device: torch.device,
 
 def train_seq_model(name: str, build_model, loss_fn, epochs: int, batch_size: int,
                     lr: float, device: torch.device, val_subset: int = 2048,
-                    aux_cls_weight: float = 1.0,
+                    aux_charpos_weight: float = 1.0,
                     patience: int = 10, min_delta: float = 1e-3,
                     min_epochs: int = 20) -> tuple[float, float]:
     train_ds, val_ds, _ = build_datasets("seq")
@@ -286,6 +321,7 @@ def train_seq_model(name: str, build_model, loss_fn, epochs: int, batch_size: in
 
     M = build_model().to(device)
     opt = torch.optim.Adam(M.parameters(), lr=lr)
+    dow_lut = dow_lookup_tensor().to(device)
     stopper = _EarlyStopper(patience=patience, min_delta=min_delta, min_epochs=min_epochs)
     history: list[dict[str, float]] = []
     best_csr = 0.0
@@ -296,11 +332,10 @@ def train_seq_model(name: str, build_model, loss_fn, epochs: int, batch_size: in
         for cond, seq in tqdm(loader, desc=f"{name} e{ep+1}/{epochs}", leave=False):
             cond = cond.to(device); seq = seq.to(device)
             opt.zero_grad()
-            char_logits, aux_dow_logits = M(cond, seq[:, :-1])
+            char_logits = M(cond, seq[:, :-1])
             loss_main = loss_fn(char_logits, seq[:, 1:])
-            dow_idx, _, _ = _cond_indices(cond)
-            loss_aux = F.cross_entropy(aux_dow_logits, dow_idx)
-            loss = loss_main + aux_cls_weight * loss_aux
+            loss_aux = seq_aux_dow_loss(char_logits, cond, dow_lut)
+            loss = loss_main + aux_charpos_weight * loss_aux
             loss.backward(); opt.step()
             sum_loss += float(loss_main.item()); sum_aux += float(loss_aux.item()); nb += 1
         M.eval()
@@ -326,15 +361,18 @@ def train_seq_model(name: str, build_model, loss_fn, epochs: int, batch_size: in
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--model", choices=list(config.MODEL_NAMES) + ["all"], default="all")
+    p.add_argument("--model", default="all",
+                   help="Comma-separated subset of {cgan,cvae,clstm,ctransformer} or 'all'. "
+                        "Examples: --model clstm | --model clstm,ctransformer | --model all")
     p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--lr-gan", type=float, default=2e-4)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--aux-dow-weight", type=float, default=2.0,
                    help="cGAN/cVAE auxiliary DOW loss weight (0 disables; v3 default 2.0)")
-    p.add_argument("--aux-cls-weight", type=float, default=1.0,
-                   help="cLSTM/cTransformer DOW classifier head weight (v3.1 default 1.0)")
+    p.add_argument("--aux-charpos-weight", type=float, default=1.0,
+                   help="cLSTM/cTransformer direct char-position DOW loss weight "
+                        "(v3.2 default 1.0; replaces v3.1 --aux-cls-weight)")
     p.add_argument("--patience", type=int, default=10,
                    help="Early stopping patience on val_csr (epochs of no improvement)")
     p.add_argument("--min-delta", type=float, default=1e-3,
@@ -349,7 +387,13 @@ def main() -> None:
     print(f"using device: {dev}")
     config.WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    targets = list(config.MODEL_NAMES) if args.model == "all" else [args.model]
+    if args.model == "all":
+        targets = list(config.MODEL_NAMES)
+    else:
+        targets = [t.strip() for t in args.model.split(",") if t.strip()]
+        unknown = [t for t in targets if t not in config.MODEL_NAMES]
+        if unknown:
+            raise ValueError(f"unknown model(s): {unknown}; valid: {list(config.MODEL_NAMES)}")
     summary: dict[str, dict[str, float]] = {}
     for name in targets:
         print(f"\n===== training {name} =====")
@@ -363,11 +407,11 @@ def main() -> None:
         elif name == "clstm":
             best, dt = train_seq_model("clstm", CLSTM, lstm_loss,
                                        args.epochs, args.batch_size, args.lr, dev,
-                                       aux_cls_weight=args.aux_cls_weight, **es_kw)
+                                       aux_charpos_weight=args.aux_charpos_weight, **es_kw)
         elif name == "ctransformer":
             best, dt = train_seq_model("ctransformer", CTransformer, transformer_loss,
                                        args.epochs, args.batch_size, args.lr, dev,
-                                       aux_cls_weight=args.aux_cls_weight, **es_kw)
+                                       aux_charpos_weight=args.aux_charpos_weight, **es_kw)
         else:
             raise ValueError(name)
         summary[name] = {"best_val_csr": best, "wall_seconds": dt}
