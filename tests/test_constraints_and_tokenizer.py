@@ -98,7 +98,11 @@ def test_models_forward_smoke() -> None:
     seq = torch.zeros(B, config.MAX_SEQ_LEN, dtype=torch.long)
     seq[:, 0] = config.BOS_ID
     lm = CLSTM()
-    assert lm(cond, seq[:, :-1]).shape == (B, config.MAX_SEQ_LEN - 1, config.VOCAB_SIZE)
+    char_logits, aux_dow = lm(cond, seq[:, :-1])
+    assert char_logits.shape == (B, config.MAX_SEQ_LEN - 1, config.VOCAB_SIZE)
+    assert aux_dow.shape == (B, len(config.DOW_TOKENS))
 
     tm = CTransformer()
-    assert tm(cond, seq[:, :-1]).shape == (B, config.MAX_SEQ_LEN - 1, config.VOCAB_SIZE)
+    char_logits, aux_dow = tm(cond, seq[:, :-1])
+    assert char_logits.shape == (B, config.MAX_SEQ_LEN - 1, config.VOCAB_SIZE)
+    assert aux_dow.shape == (B, len(config.DOW_TOKENS))

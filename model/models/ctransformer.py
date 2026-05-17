@@ -21,6 +21,7 @@ D_MODEL: int = 128
 N_HEADS: int = 4
 D_FF: int = 256
 N_LAYERS: int = 4
+N_DOW: int = len(config.DOW_TOKENS)  # 7
 
 
 class MultiHeadAttention(nn.Module):
@@ -106,6 +107,7 @@ class CTransformer(nn.Module):
                                      for _ in range(n_layers)])
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size)
+        self.aux_head = nn.Linear(d_model, N_DOW)
 
     def _backbone(self, cond: torch.Tensor, seq_in: torch.Tensor) -> torch.Tensor:
         b, t = seq_in.shape
@@ -118,11 +120,15 @@ class CTransformer(nn.Module):
             x = block(x, mask=mask)
         return self.ln_f(x)
 
-    def forward(self, cond: torch.Tensor, seq_in: torch.Tensor) -> torch.Tensor:
-        """Training forward. Returns logits aligned with the *char* positions only
-        (the condition token's logits are discarded)."""
+    def forward(self, cond: torch.Tensor, seq_in: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Training forward. Returns:
+            - char_logits over the T char positions (cond-token logits discarded)
+            - aux_dow_logits from the cond-token's final hidden (position 0)
+        """
         h = self._backbone(cond, seq_in)
-        return self.head(h[:, 1:, :])  # (B, T, V)
+        char_logits = self.head(h[:, 1:, :])              # (B, T, V)
+        aux_dow_logits = self.aux_head(h[:, 0, :])        # (B, 7)
+        return char_logits, aux_dow_logits
 
     @torch.no_grad()
     def sample(self, cond: torch.Tensor, temperature: float = 1.0,

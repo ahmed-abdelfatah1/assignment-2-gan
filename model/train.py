@@ -40,6 +40,33 @@ def _subset(val_ds: DateDataset, n: int) -> DateDataset:
     return out
 
 
+class _EarlyStopper:
+    """Stops training when val_csr hasn't improved by min_delta for `patience` epochs.
+    The first `min_epochs` epochs are exempt (warmup) — important for cGAN, whose
+    aux-DOW loss often plateaus at chance for ~17 epochs before breaking through.
+    """
+
+    def __init__(self, patience: int = 10, min_delta: float = 1e-3, min_epochs: int = 20) -> None:
+        self.patience = patience
+        self.min_delta = min_delta
+        self.min_epochs = min_epochs
+        self.best = -1.0
+        self.epochs_since_improvement = 0
+        self.best_epoch = 0
+
+    def step(self, epoch: int, val_metric: float) -> bool:
+        """Update with the latest val metric. Returns True iff training should stop."""
+        if val_metric > self.best + self.min_delta:
+            self.best = val_metric
+            self.best_epoch = epoch
+            self.epochs_since_improvement = 0
+        else:
+            self.epochs_since_improvement += 1
+        if epoch + 1 < self.min_epochs:
+            return False
+        return self.epochs_since_improvement >= self.patience
+
+
 def _cond_indices(cond: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Extract (dow_idx, mon_idx, dec_idx) from a (B, 62) one-hot cond batch."""
     n_dow = len(config.DOW_TOKENS)
@@ -130,7 +157,9 @@ def _save_weights(name: str, state_dict: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def train_cgan(epochs: int, batch_size: int, lr: float, device: torch.device,
-               aux_weight: float = 2.0, val_subset: int = 4096) -> tuple[float, float]:
+               aux_weight: float = 2.0, val_subset: int = 4096,
+               patience: int = 10, min_delta: float = 1e-3,
+               min_epochs: int = 20) -> tuple[float, float]:
     train_ds, val_ds, _ = build_datasets("vec")
     val_small = _subset(val_ds, val_subset)
     loader = _make_loader(train_ds, batch_size, device)
@@ -140,6 +169,7 @@ def train_cgan(epochs: int, batch_size: int, lr: float, device: torch.device,
     opt_g = torch.optim.Adam(G.parameters(), lr=lr, betas=(0.5, 0.999))
     opt_d = torch.optim.Adam(D.parameters(), lr=lr, betas=(0.5, 0.999))
     dow_lut = dow_lookup_tensor().to(device)
+    stopper = _EarlyStopper(patience=patience, min_delta=min_delta, min_epochs=min_epochs)
 
     history: list[dict[str, float]] = []
     best_csr = 0.0
@@ -174,6 +204,9 @@ def train_cgan(epochs: int, batch_size: int, lr: float, device: torch.device,
         if val_csr > best_csr:
             best_csr = val_csr
             _save_weights("cgan", {"G": G.state_dict(), "D": D.state_dict()})
+        if stopper.step(ep, val_csr):
+            print(f"[cgan] early stop at epoch {ep+1} (best {stopper.best:.3f} at epoch {stopper.best_epoch+1})")
+            break
     if best_csr == 0.0:  # save final state even if no improvement seen
         _save_weights("cgan", {"G": G.state_dict(), "D": D.state_dict()})
     _save_history("cgan", history)
@@ -185,7 +218,9 @@ def train_cgan(epochs: int, batch_size: int, lr: float, device: torch.device,
 # ---------------------------------------------------------------------------
 
 def train_cvae(epochs: int, batch_size: int, lr: float, device: torch.device,
-               aux_weight: float = 2.0, val_subset: int = 4096) -> tuple[float, float]:
+               aux_weight: float = 2.0, val_subset: int = 4096,
+               patience: int = 10, min_delta: float = 1e-3,
+               min_epochs: int = 20) -> tuple[float, float]:
     train_ds, val_ds, _ = build_datasets("vec")
     val_small = _subset(val_ds, val_subset)
     loader = _make_loader(train_ds, batch_size, device)
@@ -193,6 +228,7 @@ def train_cvae(epochs: int, batch_size: int, lr: float, device: torch.device,
     M = CVAE().to(device)
     opt = torch.optim.Adam(M.parameters(), lr=lr)
     dow_lut = dow_lookup_tensor().to(device)
+    stopper = _EarlyStopper(patience=patience, min_delta=min_delta, min_epochs=min_epochs)
     history: list[dict[str, float]] = []
     best_csr = 0.0
     t0 = time.time()
@@ -205,9 +241,16 @@ def train_cvae(epochs: int, batch_size: int, lr: float, device: torch.device,
             target = torch.stack([joint_onehot(int(d) * config.YEAR_DIGIT_DIM + int(y))
                                   for d, y in zip(day_idx, yr_idx)]).to(device)
             opt.zero_grad()
-            logits, mu, logvar = M(target, cond)
-            loss_main, _parts = vae_loss(logits, day_idx, yr_idx, mu, logvar, beta=beta)
-            aux = aux_dow_loss(logits, cond, dow_lut)
+            # Posterior pass: encoder + decoder(z_post) for reconstruction CE + KL.
+            mu, logvar = M.encode(target, cond)
+            z_post = M.reparam(mu, logvar)
+            logits_post = M.decode(z_post, cond)
+            loss_main, _parts = vae_loss(logits_post, day_idx, yr_idx, mu, logvar, beta=beta)
+            # Prior pass: decoder(z~N(0,I)) for DOW aux. Decoder gets no target info
+            # via z, so it must use cond's DOW — matches inference distribution.
+            z_prior = torch.randn(cond.shape[0], M.z_dim, device=device)
+            logits_prior = M.decode(z_prior, cond)
+            aux = aux_dow_loss(logits_prior, cond, dow_lut)
             loss = loss_main + aux_weight * aux
             loss.backward(); opt.step()
             sum_loss += float(loss_main.item()); sum_aux += float(aux.item()); nb += 1
@@ -219,6 +262,9 @@ def train_cvae(epochs: int, batch_size: int, lr: float, device: torch.device,
         if val_csr > best_csr:
             best_csr = val_csr
             _save_weights("cvae", M.state_dict())
+        if stopper.step(ep, val_csr):
+            print(f"[cvae] early stop at epoch {ep+1} (best {stopper.best:.3f} at epoch {stopper.best_epoch+1})")
+            break
     if best_csr == 0.0:
         _save_weights("cvae", M.state_dict())
     _save_history("cvae", history)
@@ -230,33 +276,44 @@ def train_cvae(epochs: int, batch_size: int, lr: float, device: torch.device,
 # ---------------------------------------------------------------------------
 
 def train_seq_model(name: str, build_model, loss_fn, epochs: int, batch_size: int,
-                    lr: float, device: torch.device, val_subset: int = 2048) -> tuple[float, float]:
+                    lr: float, device: torch.device, val_subset: int = 2048,
+                    aux_cls_weight: float = 1.0,
+                    patience: int = 10, min_delta: float = 1e-3,
+                    min_epochs: int = 20) -> tuple[float, float]:
     train_ds, val_ds, _ = build_datasets("seq")
     val_small = _subset(val_ds, val_subset)
     loader = _make_loader(train_ds, batch_size, device)
 
     M = build_model().to(device)
     opt = torch.optim.Adam(M.parameters(), lr=lr)
+    stopper = _EarlyStopper(patience=patience, min_delta=min_delta, min_epochs=min_epochs)
     history: list[dict[str, float]] = []
     best_csr = 0.0
     t0 = time.time()
     for ep in range(epochs):
         M.train()
-        sum_loss = 0.0; nb = 0
+        sum_loss = sum_aux = 0.0; nb = 0
         for cond, seq in tqdm(loader, desc=f"{name} e{ep+1}/{epochs}", leave=False):
             cond = cond.to(device); seq = seq.to(device)
             opt.zero_grad()
-            logits = M(cond, seq[:, :-1])
-            loss = loss_fn(logits, seq[:, 1:])
+            char_logits, aux_dow_logits = M(cond, seq[:, :-1])
+            loss_main = loss_fn(char_logits, seq[:, 1:])
+            dow_idx, _, _ = _cond_indices(cond)
+            loss_aux = F.cross_entropy(aux_dow_logits, dow_idx)
+            loss = loss_main + aux_cls_weight * loss_aux
             loss.backward(); opt.step()
-            sum_loss += float(loss.item()); nb += 1
+            sum_loss += float(loss_main.item()); sum_aux += float(loss_aux.item()); nb += 1
         M.eval()
         val_csr = _val_csr_seq(lambda c: M.sample(c, temperature=1.0), val_small, device)
-        history.append({"epoch": ep + 1, "train_loss": sum_loss / max(1, nb), "val_csr": val_csr})
-        print(f"[{name}] epoch {ep+1}/{epochs}  loss={sum_loss/max(1,nb):.4f}  val_csr={val_csr:.3f}")
+        history.append({"epoch": ep + 1, "train_loss": sum_loss / max(1, nb),
+                        "train_aux": sum_aux / max(1, nb), "val_csr": val_csr})
+        print(f"[{name}] epoch {ep+1}/{epochs}  loss={sum_loss/max(1,nb):.4f}  aux={sum_aux/max(1,nb):.4f}  val_csr={val_csr:.3f}")
         if val_csr > best_csr:
             best_csr = val_csr
             _save_weights(name, M.state_dict())
+        if stopper.step(ep, val_csr):
+            print(f"[{name}] early stop at epoch {ep+1} (best {stopper.best:.3f} at epoch {stopper.best_epoch+1})")
+            break
     if best_csr == 0.0:
         _save_weights(name, M.state_dict())
     _save_history(name, history)
@@ -276,6 +333,14 @@ def main() -> None:
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--aux-dow-weight", type=float, default=2.0,
                    help="cGAN/cVAE auxiliary DOW loss weight (0 disables; v3 default 2.0)")
+    p.add_argument("--aux-cls-weight", type=float, default=1.0,
+                   help="cLSTM/cTransformer DOW classifier head weight (v3.1 default 1.0)")
+    p.add_argument("--patience", type=int, default=10,
+                   help="Early stopping patience on val_csr (epochs of no improvement)")
+    p.add_argument("--min-delta", type=float, default=1e-3,
+                   help="Minimum val_csr improvement to reset patience")
+    p.add_argument("--min-epochs", type=int, default=20,
+                   help="Warmup before early stopping is allowed to trigger")
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     args = p.parse_args()
 
@@ -288,18 +353,21 @@ def main() -> None:
     summary: dict[str, dict[str, float]] = {}
     for name in targets:
         print(f"\n===== training {name} =====")
+        es_kw = dict(patience=args.patience, min_delta=args.min_delta, min_epochs=args.min_epochs)
         if name == "cgan":
             best, dt = train_cgan(args.epochs, args.batch_size, args.lr_gan, dev,
-                                  aux_weight=args.aux_dow_weight)
+                                  aux_weight=args.aux_dow_weight, **es_kw)
         elif name == "cvae":
             best, dt = train_cvae(args.epochs, args.batch_size, args.lr, dev,
-                                  aux_weight=args.aux_dow_weight)
+                                  aux_weight=args.aux_dow_weight, **es_kw)
         elif name == "clstm":
             best, dt = train_seq_model("clstm", CLSTM, lstm_loss,
-                                       args.epochs, args.batch_size, args.lr, dev)
+                                       args.epochs, args.batch_size, args.lr, dev,
+                                       aux_cls_weight=args.aux_cls_weight, **es_kw)
         elif name == "ctransformer":
             best, dt = train_seq_model("ctransformer", CTransformer, transformer_loss,
-                                       args.epochs, args.batch_size, args.lr, dev)
+                                       args.epochs, args.batch_size, args.lr, dev,
+                                       aux_cls_weight=args.aux_cls_weight, **es_kw)
         else:
             raise ValueError(name)
         summary[name] = {"best_val_csr": best, "wall_seconds": dt}
