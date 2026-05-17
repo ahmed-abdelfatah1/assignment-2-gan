@@ -5,6 +5,8 @@ from __future__ import annotations
 import datetime as _dt
 import re
 
+import torch
+
 from model import config
 
 _LINE_RE = re.compile(
@@ -93,6 +95,38 @@ def verify_date(date_str: str, conds: dict[str, str]) -> bool:
         return False
 
     return True
+
+
+_DOW_LOOKUP_CACHE: torch.Tensor | None = None
+INVALID_DOW: int = 7  # sentinel bucket for combinations that are not real dates
+
+
+def dow_lookup_tensor() -> torch.Tensor:
+    """Precomputed `(12, 41, 310)` tensor of DOW indices (0..6) or INVALID_DOW (=7).
+
+    Axis 0: month index (0..11)
+    Axis 1: decade index (0..40, decade token 180..220)
+    Axis 2: joint idx = day_idx * 10 + year_digit (0..309)
+    """
+    global _DOW_LOOKUP_CACHE
+    if _DOW_LOOKUP_CACHE is not None:
+        return _DOW_LOOKUP_CACHE
+    n_mon = len(config.MONTH_TOKENS)
+    n_dec = len(config.DECADE_TOKENS)
+    lut = torch.full((n_mon, n_dec, config.JOINT_DIM), INVALID_DOW, dtype=torch.long)
+    for mi in range(n_mon):
+        month = mi + 1
+        for di in range(n_dec):
+            dec_val = int(config.DECADE_TOKENS[di])
+            for j in range(config.JOINT_DIM):
+                day_idx, year_digit = divmod(j, config.YEAR_DIGIT_DIM)
+                day = day_idx + 1
+                year = dec_val * 10 + year_digit
+                if not valid_calendar_date(day, month, year):
+                    continue
+                lut[mi, di, j] = _dt.date(year, month, day).weekday()
+    _DOW_LOOKUP_CACHE = lut
+    return lut
 
 
 def which_condition_failed(date_str: str, conds: dict[str, str]) -> str:

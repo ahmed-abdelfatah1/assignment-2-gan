@@ -15,10 +15,12 @@ for _root in (_HERE.parent, _HERE.parent.parent):
         sys.path.insert(0, str(_root))
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from model import config
+from model.constraints import INVALID_DOW, dow_lookup_tensor
 from model.dataset import build_datasets, DateDataset
 from model.metrics import condition_satisfaction_rate
 from model.models.cgan import Discriminator, Generator, d_loss, g_loss
@@ -36,6 +38,39 @@ def _subset(val_ds: DateDataset, n: int) -> DateDataset:
     out._indices = val_ds._indices[:n]
     out._parsed = val_ds._parsed[:n]
     return out
+
+
+def _cond_indices(cond: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Extract (dow_idx, mon_idx, dec_idx) from a (B, 62) one-hot cond batch."""
+    n_dow = len(config.DOW_TOKENS)
+    n_mon = len(config.MONTH_TOKENS)
+    n_leap = len(config.LEAP_TOKENS)
+    dow_idx = cond[:, :n_dow].argmax(dim=-1)
+    mon_idx = cond[:, n_dow:n_dow + n_mon].argmax(dim=-1)
+    dec_off = n_dow + n_mon + n_leap
+    dec_idx = cond[:, dec_off:dec_off + len(config.DECADE_TOKENS)].argmax(dim=-1)
+    return dow_idx, mon_idx, dec_idx
+
+
+def aux_dow_loss(logits: torch.Tensor, cond: torch.Tensor,
+                 dow_lut: torch.Tensor, invalid_weight: float = 1.0) -> torch.Tensor:
+    """AC-GAN-style auxiliary loss that forces the predicted joint-softmax to honor
+    the requested DOW condition. Fully differentiable in soft-probability space.
+
+    Returns a scalar tensor combining: -log P(DOW = target) + invalid_weight * P(invalid).
+    """
+    probs = F.softmax(logits, dim=-1)              # (B, 310)
+    dow_idx, mon_idx, dec_idx = _cond_indices(cond)
+    # Per-sample (310,) tensor of DOW indices ∈ {0..6, INVALID_DOW=7}
+    dow_map = dow_lut[mon_idx, dec_idx]              # (B, 310)
+    # One-hot across 8 buckets (7 DOWs + invalid)
+    mask = F.one_hot(dow_map, num_classes=INVALID_DOW + 1).float()  # (B, 310, 8)
+    dow_probs = torch.einsum("bj,bjk->bk", probs, mask)              # (B, 8)
+    eps = 1e-8
+    target_prob = dow_probs.gather(1, dow_idx.unsqueeze(1)).squeeze(1)  # (B,)
+    ce = -(target_prob + eps).log().mean()
+    invalid_mass = dow_probs[:, INVALID_DOW].mean()
+    return ce + invalid_weight * invalid_mass
 
 
 def _make_loader(ds: DateDataset, batch_size: int, device: torch.device) -> DataLoader:
@@ -95,7 +130,7 @@ def _save_weights(name: str, state_dict: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def train_cgan(epochs: int, batch_size: int, lr: float, device: torch.device,
-               val_subset: int = 4096) -> tuple[float, float]:
+               aux_weight: float = 2.0, val_subset: int = 4096) -> tuple[float, float]:
     train_ds, val_ds, _ = build_datasets("vec")
     val_small = _subset(val_ds, val_subset)
     loader = _make_loader(train_ds, batch_size, device)
@@ -104,13 +139,14 @@ def train_cgan(epochs: int, batch_size: int, lr: float, device: torch.device,
     D = Discriminator().to(device)
     opt_g = torch.optim.Adam(G.parameters(), lr=lr, betas=(0.5, 0.999))
     opt_d = torch.optim.Adam(D.parameters(), lr=lr, betas=(0.5, 0.999))
+    dow_lut = dow_lookup_tensor().to(device)
 
     history: list[dict[str, float]] = []
     best_csr = 0.0
     t0 = time.time()
     for ep in range(epochs):
         G.train(); D.train()
-        sum_g = sum_d = 0.0; nb = 0
+        sum_g = sum_d = sum_aux = 0.0; nb = 0
         for cond, day_idx, yr_idx in tqdm(loader, desc=f"cgan e{ep+1}/{epochs}", leave=False):
             cond = cond.to(device); day_idx = day_idx.to(device); yr_idx = yr_idx.to(device)
             real = torch.stack([joint_onehot(int(d) * config.YEAR_DIGIT_DIM + int(y))
@@ -119,16 +155,22 @@ def train_cgan(epochs: int, batch_size: int, lr: float, device: torch.device,
             opt_d.zero_grad()
             loss_d = d_loss(D(real, cond), D(fake, cond))
             loss_d.backward(); opt_d.step()
-            fake_g = G.sample_onehot(cond)
+            # Generator step: adversarial + auxiliary DOW supervision (AC-GAN style)
+            z = torch.randn(cond.shape[0], G.noise_dim, device=device)
+            logits = G(z, cond)
+            fake_g = torch.nn.functional.gumbel_softmax(logits, tau=1.0, hard=True, dim=-1)
             opt_g.zero_grad()
-            loss_g = g_loss(D(fake_g, cond))
+            adv = g_loss(D(fake_g, cond))
+            aux = aux_dow_loss(logits, cond, dow_lut)
+            loss_g = adv + aux_weight * aux
             loss_g.backward(); opt_g.step()
-            sum_g += float(loss_g.item()); sum_d += float(loss_d.item()); nb += 1
+            sum_g += float(adv.item()); sum_d += float(loss_d.item()); sum_aux += float(aux.item()); nb += 1
         G.eval()
         val_csr = _val_csr_vec(G.sample_indices, val_small, device)
         history.append({"epoch": ep + 1, "train_g": sum_g / max(1, nb),
-                        "train_d": sum_d / max(1, nb), "val_csr": val_csr})
-        print(f"[cgan] epoch {ep+1}/{epochs}  G={sum_g/max(1,nb):.4f}  D={sum_d/max(1,nb):.4f}  val_csr={val_csr:.3f}")
+                        "train_d": sum_d / max(1, nb),
+                        "train_aux": sum_aux / max(1, nb), "val_csr": val_csr})
+        print(f"[cgan] epoch {ep+1}/{epochs}  G={sum_g/max(1,nb):.4f}  D={sum_d/max(1,nb):.4f}  aux={sum_aux/max(1,nb):.4f}  val_csr={val_csr:.3f}")
         if val_csr > best_csr:
             best_csr = val_csr
             _save_weights("cgan", {"G": G.state_dict(), "D": D.state_dict()})
@@ -143,34 +185,37 @@ def train_cgan(epochs: int, batch_size: int, lr: float, device: torch.device,
 # ---------------------------------------------------------------------------
 
 def train_cvae(epochs: int, batch_size: int, lr: float, device: torch.device,
-               val_subset: int = 4096) -> tuple[float, float]:
+               aux_weight: float = 2.0, val_subset: int = 4096) -> tuple[float, float]:
     train_ds, val_ds, _ = build_datasets("vec")
     val_small = _subset(val_ds, val_subset)
     loader = _make_loader(train_ds, batch_size, device)
 
     M = CVAE().to(device)
     opt = torch.optim.Adam(M.parameters(), lr=lr)
+    dow_lut = dow_lookup_tensor().to(device)
     history: list[dict[str, float]] = []
     best_csr = 0.0
     t0 = time.time()
     for ep in range(epochs):
         beta = min(1.0, (ep + 1) / 10.0)
         M.train()
-        sum_loss = 0.0; nb = 0
+        sum_loss = sum_aux = 0.0; nb = 0
         for cond, day_idx, yr_idx in tqdm(loader, desc=f"cvae e{ep+1}/{epochs}", leave=False):
             cond = cond.to(device); day_idx = day_idx.to(device); yr_idx = yr_idx.to(device)
             target = torch.stack([joint_onehot(int(d) * config.YEAR_DIGIT_DIM + int(y))
                                   for d, y in zip(day_idx, yr_idx)]).to(device)
             opt.zero_grad()
             logits, mu, logvar = M(target, cond)
-            loss, _parts = vae_loss(logits, day_idx, yr_idx, mu, logvar, beta=beta)
+            loss_main, _parts = vae_loss(logits, day_idx, yr_idx, mu, logvar, beta=beta)
+            aux = aux_dow_loss(logits, cond, dow_lut)
+            loss = loss_main + aux_weight * aux
             loss.backward(); opt.step()
-            sum_loss += float(loss.item()); nb += 1
+            sum_loss += float(loss_main.item()); sum_aux += float(aux.item()); nb += 1
         M.eval()
         val_csr = _val_csr_vec(M.sample_indices, val_small, device)
         history.append({"epoch": ep + 1, "beta": beta, "train_loss": sum_loss / max(1, nb),
-                        "val_csr": val_csr})
-        print(f"[cvae] epoch {ep+1}/{epochs}  beta={beta:.2f}  loss={sum_loss/max(1,nb):.4f}  val_csr={val_csr:.3f}")
+                        "train_aux": sum_aux / max(1, nb), "val_csr": val_csr})
+        print(f"[cvae] epoch {ep+1}/{epochs}  beta={beta:.2f}  loss={sum_loss/max(1,nb):.4f}  aux={sum_aux/max(1,nb):.4f}  val_csr={val_csr:.3f}")
         if val_csr > best_csr:
             best_csr = val_csr
             _save_weights("cvae", M.state_dict())
@@ -229,6 +274,8 @@ def main() -> None:
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--lr-gan", type=float, default=2e-4)
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--aux-dow-weight", type=float, default=2.0,
+                   help="cGAN/cVAE auxiliary DOW loss weight (0 disables; v3 default 2.0)")
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     args = p.parse_args()
 
@@ -242,9 +289,11 @@ def main() -> None:
     for name in targets:
         print(f"\n===== training {name} =====")
         if name == "cgan":
-            best, dt = train_cgan(args.epochs, args.batch_size, args.lr_gan, dev)
+            best, dt = train_cgan(args.epochs, args.batch_size, args.lr_gan, dev,
+                                  aux_weight=args.aux_dow_weight)
         elif name == "cvae":
-            best, dt = train_cvae(args.epochs, args.batch_size, args.lr, dev)
+            best, dt = train_cvae(args.epochs, args.batch_size, args.lr, dev,
+                                  aux_weight=args.aux_dow_weight)
         elif name == "clstm":
             best, dt = train_seq_model("clstm", CLSTM, lstm_loss,
                                        args.epochs, args.batch_size, args.lr, dev)
