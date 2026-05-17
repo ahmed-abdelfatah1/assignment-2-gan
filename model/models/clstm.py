@@ -9,8 +9,8 @@ import torch.nn.functional as F
 from model import config
 from model.tokenizer import DateTokenizer
 
-EMB_DIM: int = 32
-HIDDEN: int = 128
+EMB_DIM: int = 64
+HIDDEN: int = 256
 
 
 class CLSTM(nn.Module):

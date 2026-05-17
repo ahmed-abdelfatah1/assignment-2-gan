@@ -25,7 +25,7 @@ from model.models.cgan import Discriminator, Generator, d_loss, g_loss
 from model.models.clstm import CLSTM, lstm_loss
 from model.models.ctransformer import CTransformer, transformer_loss
 from model.models.cvae import CVAE, vae_loss
-from model.tokenizer import ConditionEncoder, decode_gan_output, gan_target_onehot
+from model.tokenizer import ConditionEncoder, decode_gan_output, joint_onehot
 
 
 def _subset(val_ds: DateDataset, n: int) -> DateDataset:
@@ -36,6 +36,20 @@ def _subset(val_ds: DateDataset, n: int) -> DateDataset:
     out._indices = val_ds._indices[:n]
     out._parsed = val_ds._parsed[:n]
     return out
+
+
+def _make_loader(ds: DateDataset, batch_size: int, device: torch.device) -> DataLoader:
+    """DataLoader with CUDA-only num_workers+pin_memory speedups (Windows + num_workers > 0 in this venv triggers fork issues, so we keep workers=0 on CPU)."""
+    use_cuda = device.type == "cuda"
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=2 if use_cuda else 0,
+        pin_memory=use_cuda,
+        persistent_workers=use_cuda,
+    )
 
 
 def _val_csr_vec(sample_fn, val_ds: DateDataset, device: torch.device,
@@ -84,7 +98,7 @@ def train_cgan(epochs: int, batch_size: int, lr: float, device: torch.device,
                val_subset: int = 4096) -> tuple[float, float]:
     train_ds, val_ds, _ = build_datasets("vec")
     val_small = _subset(val_ds, val_subset)
-    loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
+    loader = _make_loader(train_ds, batch_size, device)
 
     G = Generator().to(device)
     D = Discriminator().to(device)
@@ -99,7 +113,8 @@ def train_cgan(epochs: int, batch_size: int, lr: float, device: torch.device,
         sum_g = sum_d = 0.0; nb = 0
         for cond, day_idx, yr_idx in tqdm(loader, desc=f"cgan e{ep+1}/{epochs}", leave=False):
             cond = cond.to(device); day_idx = day_idx.to(device); yr_idx = yr_idx.to(device)
-            real = torch.stack([gan_target_onehot(int(d), int(y)) for d, y in zip(day_idx, yr_idx)]).to(device)
+            real = torch.stack([joint_onehot(int(d) * config.YEAR_DIGIT_DIM + int(y))
+                                for d, y in zip(day_idx, yr_idx)]).to(device)
             fake = G.sample_onehot(cond).detach()
             opt_d.zero_grad()
             loss_d = d_loss(D(real, cond), D(fake, cond))
@@ -131,7 +146,7 @@ def train_cvae(epochs: int, batch_size: int, lr: float, device: torch.device,
                val_subset: int = 4096) -> tuple[float, float]:
     train_ds, val_ds, _ = build_datasets("vec")
     val_small = _subset(val_ds, val_subset)
-    loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
+    loader = _make_loader(train_ds, batch_size, device)
 
     M = CVAE().to(device)
     opt = torch.optim.Adam(M.parameters(), lr=lr)
@@ -144,7 +159,8 @@ def train_cvae(epochs: int, batch_size: int, lr: float, device: torch.device,
         sum_loss = 0.0; nb = 0
         for cond, day_idx, yr_idx in tqdm(loader, desc=f"cvae e{ep+1}/{epochs}", leave=False):
             cond = cond.to(device); day_idx = day_idx.to(device); yr_idx = yr_idx.to(device)
-            target = torch.stack([gan_target_onehot(int(d), int(y)) for d, y in zip(day_idx, yr_idx)]).to(device)
+            target = torch.stack([joint_onehot(int(d) * config.YEAR_DIGIT_DIM + int(y))
+                                  for d, y in zip(day_idx, yr_idx)]).to(device)
             opt.zero_grad()
             logits, mu, logvar = M(target, cond)
             loss, _parts = vae_loss(logits, day_idx, yr_idx, mu, logvar, beta=beta)
@@ -172,7 +188,7 @@ def train_seq_model(name: str, build_model, loss_fn, epochs: int, batch_size: in
                     lr: float, device: torch.device, val_subset: int = 2048) -> tuple[float, float]:
     train_ds, val_ds, _ = build_datasets("seq")
     val_small = _subset(val_ds, val_subset)
-    loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
+    loader = _make_loader(train_ds, batch_size, device)
 
     M = build_model().to(device)
     opt = torch.optim.Adam(M.parameters(), lr=lr)
@@ -209,8 +225,8 @@ def train_seq_model(name: str, build_model, loss_fn, epochs: int, batch_size: in
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--model", choices=list(config.MODEL_NAMES) + ["all"], default="all")
-    p.add_argument("--epochs", type=int, default=30)
-    p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--epochs", type=int, default=60)
+    p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--lr-gan", type=float, default=2e-4)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")

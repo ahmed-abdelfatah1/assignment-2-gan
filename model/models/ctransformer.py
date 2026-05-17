@@ -17,10 +17,10 @@ import torch.nn.functional as F
 from model import config
 from model.tokenizer import DateTokenizer
 
-D_MODEL: int = 64
+D_MODEL: int = 128
 N_HEADS: int = 4
-D_FF: int = 128
-N_LAYERS: int = 2
+D_FF: int = 256
+N_LAYERS: int = 4
 
 
 class MultiHeadAttention(nn.Module):

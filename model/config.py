@@ -30,7 +30,8 @@ assert COND_DIM == 62
 
 DAY_DIM: int = 31           # day-of-month index 0..30
 YEAR_DIGIT_DIM: int = 10    # last digit 0..9
-GAN_OUT_DIM: int = DAY_DIM + YEAR_DIGIT_DIM   # 41
+GAN_OUT_DIM: int = DAY_DIM + YEAR_DIGIT_DIM   # 41 (legacy: two independent softmaxes)
+JOINT_DIM: int = DAY_DIM * YEAR_DIGIT_DIM     # 310 (v2: single joint softmax)
 
 CHAR_VOCAB: list[str] = [
     "<pad>", "<bos>", "<eos>", "-",

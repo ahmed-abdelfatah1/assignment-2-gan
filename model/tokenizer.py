@@ -81,8 +81,25 @@ def encode_gan_target(date_str: str) -> tuple[int, int]:
 
 
 def gan_target_onehot(day_idx: int, year_digit: int) -> torch.Tensor:
-    """Build the 41-dim one-hot target used by the cGAN discriminator."""
+    """Build the 41-dim one-hot target used by the legacy v1 cGAN discriminator."""
     t = torch.zeros(config.GAN_OUT_DIM, dtype=torch.float32)
     t[day_idx] = 1.0
     t[config.DAY_DIM + year_digit] = 1.0
+    return t
+
+
+def joint_idx(day_idx: int, year_digit: int) -> int:
+    """Pack (day_idx, year_digit) into a single index in [0, 310)."""
+    return day_idx * config.YEAR_DIGIT_DIM + year_digit
+
+
+def joint_split(idx: int) -> tuple[int, int]:
+    """Inverse of joint_idx."""
+    return divmod(idx, config.YEAR_DIGIT_DIM)
+
+
+def joint_onehot(idx: int) -> torch.Tensor:
+    """310-dim one-hot for the v2 GAN discriminator."""
+    t = torch.zeros(config.JOINT_DIM, dtype=torch.float32)
+    t[idx] = 1.0
     return t

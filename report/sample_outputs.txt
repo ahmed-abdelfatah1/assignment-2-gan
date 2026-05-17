@@ -1,0 +1,88 @@
+### cgan
+CSR=0.1439  per_cond={'dow': 0.14398853007441798, 'mon': 0.9990441728681642, 'leap': 0.998839352768485, 'dec': 0.9990441728681642}  diversity=0.9520
+
+-- successes --
+[FRI] [APR] [False] [211]  -> 12-4-2115  OK
+[THU] [JUL] [False] [213]  -> 16-7-2133  OK
+[TUE] [OCT] [False] [209]  -> 9-10-2091  OK
+[TUE] [JUL] [True] [188]  -> 17-7-1888  OK
+[WED] [AUG] [False] [185]  -> 7-8-1850  OK
+[SAT] [NOV] [False] [185]  -> 24-11-1855  OK
+[WED] [OCT] [False] [199]  -> 22-10-1997  OK
+[MON] [JUL] [False] [188]  -> 12-7-1886  OK
+[THU] [DEC] [True] [216]  -> 11-12-2160  OK
+[THU] [NOV] [False] [210]  -> 22-11-2103  OK
+
+-- failures --
+[SUN] [APR] [False] [187]  -> 19-4-1879  FAIL(dow)
+[MON] [APR] [False] [188]  -> 18-4-1882  FAIL(dow)
+[SUN] [NOV] [False] [184]  -> 4-11-1847  FAIL(dow)
+[WED] [OCT] [False] [206]  -> 8-10-2067  FAIL(dow)
+[THU] [SEP] [False] [184]  -> 22-9-1841  FAIL(dow)
+
+### cvae
+CSR=0.1383  per_cond={'dow': 0.13859493411620127, 'mon': 0.9989076261350447, 'leap': 0.9977469789035297, 'dec': 0.9989076261350447}  diversity=0.9585
+
+-- successes --
+[SUN] [APR] [False] [187]  -> 22-4-1877  OK
+[WED] [OCT] [False] [206]  -> 13-10-2066  OK
+[SAT] [OCT] [False] [186]  -> 7-10-1865  OK
+[TUE] [DEC] [False] [196]  -> 5-12-1967  OK
+[FRI] [MAY] [True] [207]  -> 15-5-2076  OK
+[THU] [DEC] [False] [190]  -> 31-12-1903  OK
+[THU] [OCT] [False] [210]  -> 13-10-2107  OK
+[MON] [MAY] [False] [183]  -> 12-5-1834  OK
+[THU] [JUL] [False] [207]  -> 27-7-2073  OK
+[SAT] [DEC] [False] [192]  -> 11-12-1926  OK
+
+-- failures --
+[MON] [APR] [False] [188]  -> 14-4-1889  FAIL(dow)
+[SUN] [NOV] [False] [184]  -> 17-11-1849  FAIL(dow)
+[THU] [SEP] [False] [184]  -> 15-9-1849  FAIL(dow)
+[TUE] [OCT] [False] [200]  -> 30-10-2009  FAIL(dow)
+[MON] [AUG] [False] [198]  -> 16-8-1989  FAIL(dow)
+
+### clstm
+CSR=0.1392  per_cond={'dow': 0.1403700416467536, 'mon': 0.9951525909742609, 'leap': 0.9938553970096266, 'dec': 0.9911927357137981}  diversity=0.9585
+
+-- successes --
+[MON] [APR] [False] [188]  -> 22-4-1889  OK
+[SUN] [NOV] [False] [184]  -> 19-11-1843  OK
+[MON] [AUG] [False] [198]  -> 4-8-1986  OK
+[MON] [MAR] [False] [210]  -> 8-3-2100  OK
+[FRI] [MAY] [True] [207]  -> 1-5-2076  OK
+[THU] [MAR] [False] [191]  -> 27-3-1913  OK
+[WED] [AUG] [False] [185]  -> 8-8-1855  OK
+[SAT] [MAR] [False] [212]  -> 9-3-2126  OK
+[MON] [JUN] [False] [187]  -> 9-6-1873  OK
+[THU] [SEP] [False] [183]  -> 14-9-1837  OK
+
+-- failures --
+[SUN] [APR] [False] [187]  -> 17-4-1873  FAIL(dow)
+[WED] [OCT] [False] [206]  -> 22-10-2066  FAIL(dow)
+[THU] [SEP] [False] [184]  -> 27-9-1842  FAIL(dow)
+[TUE] [OCT] [False] [200]  -> 15-10-2007  FAIL(dow)
+[TUE] [MAR] [True] [192]  -> 19-3-1924  FAIL(dow)
+
+### ctransformer
+CSR=0.1434  per_cond={'dow': 0.14344234314194032, 'mon': 0.9971325186044924, 'leap': 0.9970642452379327, 'dec': 0.996995971871373}  diversity=0.9530
+
+-- successes --
+[MON] [APR] [False] [188]  -> 30-4-1883  OK
+[THU] [SEP] [False] [184]  -> 23-9-1847  OK
+[FRI] [APR] [False] [211]  -> 18-4-2110  OK
+[THU] [JUL] [False] [213]  -> 18-7-2137  OK
+[FRI] [MAR] [False] [214]  -> 19-3-2145  OK
+[SUN] [APR] [False] [211]  -> 11-4-2117  OK
+[THU] [DEC] [False] [190]  -> 30-12-1909  OK
+[FRI] [JUL] [False] [215]  -> 23-7-2151  OK
+[MON] [MAY] [False] [183]  -> 13-5-1833  OK
+[THU] [FEB] [True] [201]  -> 2-2-2012  OK
+
+-- failures --
+[SUN] [APR] [False] [187]  -> 26-4-1870  FAIL(dow)
+[SUN] [NOV] [False] [184]  -> 17-11-1849  FAIL(dow)
+[WED] [OCT] [False] [206]  -> 9-10-2063  FAIL(dow)
+[TUE] [OCT] [False] [200]  -> 8-10-2009  FAIL(dow)
+[MON] [AUG] [False] [198]  -> 7-8-1985  FAIL(dow)
+

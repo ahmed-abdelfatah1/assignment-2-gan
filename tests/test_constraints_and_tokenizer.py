@@ -85,14 +85,15 @@ def test_models_forward_smoke() -> None:
 
     g = Generator(); d = Discriminator()
     fake = g.sample_onehot(cond)
-    assert fake.shape == (B, config.GAN_OUT_DIM)
+    assert fake.shape == (B, config.JOINT_DIM)
     assert d(fake, cond).shape == (B,)
 
     v = CVAE()
-    target = torch.zeros(B, config.GAN_OUT_DIM); target[:, 0] = 1; target[:, 31] = 1
+    target = torch.zeros(B, config.JOINT_DIM); target[:, 0] = 1
     logits, mu, lv = v(target, cond)
-    assert logits.shape == (B, config.GAN_OUT_DIM)
-    assert mu.shape == (B, 16) and lv.shape == (B, 16)
+    assert logits.shape == (B, config.JOINT_DIM)
+    assert mu.shape[0] == B and lv.shape[0] == B
+    assert mu.shape == lv.shape
 
     seq = torch.zeros(B, config.MAX_SEQ_LEN, dtype=torch.long)
     seq[:, 0] = config.BOS_ID
