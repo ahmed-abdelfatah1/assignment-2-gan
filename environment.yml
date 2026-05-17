@@ -1,0 +1,12 @@
+name: dsai490-a2
+channels:
+  - pytorch
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pytorch
+  - cpuonly
+  - numpy
+  - matplotlib
+  - tqdm
+  - pytest

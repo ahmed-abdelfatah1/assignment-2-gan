@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ipynb_checkpoints/
+.venv/
+venv/
+*.swp
+*.DS_Store
+.idea/
+.vscode/
+predictions.txt
+predictions_*.txt
+preds.txt
+artifacts.zip
+.claude/
