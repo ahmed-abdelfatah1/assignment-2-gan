@@ -26,19 +26,42 @@ output dimensionality, loss design, and architecture all follow from it.
 
 ## 2. Architecture decisions
 
-We deliver **four PyTorch models**, all trained with hand-written loops (no
-`.fit`, no Lightning). The hand-written `MultiHeadAttention` + `DecoderBlock` in
-the transformer satisfies the "no `nn.Transformer` shortcut" constraint and
-keeps the code readable.
+We deliver **four PyTorch models**, all trained with hand-written loops (no `.fit`, no Lightning). We also wrote the Transformer's attention and decoder block ourselves (no `nn.Transformer`) — both because the assignment requires it and because it keeps the code readable.
 
-| Model | Output | Why |
+### How we represent the input condition
+All four models take the same 62-dim input: a one-hot encoding of the four conditions concatenated together — 7 day-of-week slots + 12 month slots + 2 leap slots + 41 decade slots. Exactly one bit is "on" in each section. Simple, unambiguous, easy for the model to consume.
+
+### How we represent the output — and why this choice mattered
+Two families of model use two different output formats. Both are described in §4 in the context of the failures that drove the design.
+
+| Model | Output format | What that means in plain terms |
 |---|---|---|
-| **cGAN** (mandatory) | One 310-class softmax over `(day, year_digit)` pairs | A single joint softmax is the only representation that can express the non-Cartesian set of valid (day, year_digit) pairs for a given DOW (see §4). Generator: MLP `[256, 256, 256]`, Gumbel-softmax sampling, non-saturating G loss + one-sided label smoothing. Discriminator: MLP `[256, 256]`. |
-| **cVAE** (from-the-course) | One 310-class softmax | Same representational reason as cGAN. Encoder/decoder MLPs hidden=256, z=32. β annealed 0→1 over 10 epochs. |
-| **cLSTM** (outside-course) | Char sequence `dd-mm-yyyy` | Different paradigm — tests whether autoregressive char models can recover the same constraint without an explicit joint head. Hidden=256; cond projects to `(h0, c0)` **and** added to every input embedding (per-step injection). |
-| **cTransformer** (outside-course) | Char sequence `dd-mm-yyyy` | Hand-written 4-layer decoder, d_model=128, 4 heads, FFN=256. Condition becomes the position-0 prepended token (attendable via causal mask) **and** is added to every char embedding (`cond_step_proj`) — the prepended-token-only variant failed because attention from the day positions back to position 0 wasn't strong enough early in training (see §4 v3.3). |
+| **cGAN** (mandatory) | **Single softmax over 310 pairs** | The model picks one bucket out of 310. Each bucket corresponds to a specific `(day, year_digit)` pair (e.g. bucket 23 might mean "day=3, year_digit=5" → date `3-1-2005` for cond=(WED, JAN, False, 200)). We use **one** big distribution instead of two separate ones for the reason explained in §4: a separate "day distribution" plus a separate "year_digit distribution" cannot express the *scattered* set of valid pairs for a given day-of-week. One joint distribution can. |
+| **cVAE** (from the course) | Same 310-class softmax | Same representational reason as cGAN. |
+| **cLSTM** (outside the course) | Date as a string, generated one character at a time (`'0', '3', '-', '0', '1', '-', '2', '0', '0', '5'`) | A different paradigm — the model emits the date character-by-character, like writing. Tests whether a sequence model can solve this problem without the explicit joint distribution. Uses a fixed-width format `dd-mm-yyyy` so we can apply auxiliary loss at known positions (see §4). |
+| **cTransformer** (outside the course) | Same fixed-width character sequence | Same paradigm as cLSTM, different architecture. |
 
-Conditions encode as one 62-dim one-hot concat: `DOW(7) + MON(12) + LEAP(2) + DEC(41)`.
+### Architecture details in plain language
+
+**cGAN** — A *Generator* and a *Discriminator* in an adversarial loop:
+- **Generator**: 3 hidden fully-connected layers, each 256 units wide. Takes random noise + the 62-dim condition, outputs the 310 logits.
+- **Discriminator**: 2 hidden fully-connected layers, each 256 units wide. Takes a (predicted bucket, condition) pair, outputs a real/fake score.
+- **Gumbel-softmax sampling**: a math trick that lets the Generator sample a *discrete* bucket while still allowing gradients to flow back through the sampling step (vanilla `argmax` would block gradients).
+- **Non-saturating G loss + one-sided label smoothing**: two standard GAN-stability tricks. The first prevents the Generator from getting stuck early; the second tells the Discriminator "real samples have label 0.9 instead of 1.0" so it stays less confident and training doesn't collapse.
+
+**cVAE** — *Encoder* compresses an input pair (target+condition) into a small latent vector `z`; *Decoder* reconstructs the pair from `z` plus the condition.
+- Encoder and Decoder are each MLPs with hidden width 256. Latent `z` is 32-dimensional.
+- Loss = reconstruction error + β × KL divergence (standard VAE recipe). **β is annealed from 0 to 1 over the first 10 epochs**, meaning we start by letting the encoder pack as much info as it wants into `z`, then gradually pressure it to be more like a unit Gaussian. This warmup makes early training easier.
+- The actual cVAE training does *two* decoder passes per batch (one for reconstruction, one for the DOW auxiliary loss) — that's the crux of the §4 v3.1 fix.
+
+**cLSTM** — A 1-layer LSTM with 256 hidden units that generates the date string character-by-character.
+- The condition (62-dim) is projected to the LSTM's initial hidden state `(h0, c0)`.
+- The condition is **also** added to *every* character's embedding before it enters the LSTM. This "per-step injection" is critical — without it the model forgets the condition after a few characters.
+- Output is one of 14 possible characters per step (digits 0-9, dash, BOS/EOS/PAD).
+
+**cTransformer** — A 4-layer decoder-only Transformer (d_model=128, 4 attention heads, FFN width 256) that also generates the date character-by-character.
+- "Decoder-only" + "causal mask" = the model only attends to previous positions when predicting the next character (standard GPT-style setup).
+- The condition gets *two* injection paths: (1) prepended as a special "position 0" token that all other positions can attend to, AND (2) added to every character embedding (same trick as cLSTM). We tried prepended-token-only first; it failed (see §4 v3.3).
 
 ## 3. Training & evaluation
 
