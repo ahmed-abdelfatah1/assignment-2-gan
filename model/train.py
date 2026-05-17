@@ -370,9 +370,10 @@ def main() -> None:
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--aux-dow-weight", type=float, default=2.0,
                    help="cGAN/cVAE auxiliary DOW loss weight (0 disables; v3 default 2.0)")
-    p.add_argument("--aux-charpos-weight", type=float, default=1.0,
+    p.add_argument("--aux-charpos-weight", type=float, default=3.0,
                    help="cLSTM/cTransformer direct char-position DOW loss weight "
-                        "(v3.2 default 1.0; replaces v3.1 --aux-cls-weight)")
+                        "(v3.3 default 3.0; v3.2 used 1.0 but cTransformer needed more "
+                        "pull to escape the marginal-only minimum)")
     p.add_argument("--patience", type=int, default=10,
                    help="Early stopping patience on val_csr (epochs of no improvement)")
     p.add_argument("--min-delta", type=float, default=1e-3,

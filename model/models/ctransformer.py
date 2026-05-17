@@ -98,7 +98,8 @@ class CTransformer(nn.Module):
         super().__init__()
         self.max_len = max_len
         self.emb = nn.Embedding(vocab_size, d_model, padding_idx=config.PAD_ID)
-        self.cond_proj = nn.Linear(cond_dim, d_model)
+        self.cond_proj = nn.Linear(cond_dim, d_model)         # → prepended token
+        self.cond_step_proj = nn.Linear(cond_dim, d_model)    # added to every char position
         self.register_buffer("pe", sinusoidal_pe(max_len, d_model), persistent=False)
         self.register_buffer("causal_mask", torch.tril(torch.ones(max_len, max_len)),
                              persistent=False)
@@ -109,9 +110,10 @@ class CTransformer(nn.Module):
 
     def _backbone(self, cond: torch.Tensor, seq_in: torch.Tensor) -> torch.Tensor:
         b, t = seq_in.shape
-        cond_tok = self.cond_proj(cond).unsqueeze(1)        # (B, 1, d_model)
-        char_emb = self.emb(seq_in)                          # (B, T, d_model)
-        x = torch.cat([cond_tok, char_emb], dim=1)           # (B, 1+T, d_model)
+        cond_tok = self.cond_proj(cond).unsqueeze(1)           # (B, 1, d_model)
+        cond_step = self.cond_step_proj(cond).unsqueeze(1)     # (B, 1, d_model)
+        char_emb = self.emb(seq_in) + cond_step                # broadcast over T
+        x = torch.cat([cond_tok, char_emb], dim=1)             # (B, 1+T, d_model)
         x = x + self.pe[: x.shape[1]].unsqueeze(0)
         mask = self.causal_mask[: x.shape[1], : x.shape[1]].unsqueeze(0).unsqueeze(0)
         for block in self.blocks:
